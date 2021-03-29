@@ -19,14 +19,13 @@
  */
 package org.sonar.java.model;
 
-import java.util.ArrayList;
-import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Objects;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
-
 import org.eclipse.jdt.core.dom.ASTUtils;
 import org.eclipse.jdt.core.dom.IMethodBinding;
 import org.eclipse.jdt.core.dom.ITypeBinding;
@@ -55,6 +54,7 @@ final class JMethodSymbol extends JSymbol implements Symbol.MethodSymbol {
    * Cache for {@link #overriddenSymbol()}.
    */
   private List<MethodSymbol> overriddenSymbols;
+  private MethodSymbol firstOverridenSymbol;
 
   private final String signature;
 
@@ -99,81 +99,57 @@ final class JMethodSymbol extends JSymbol implements Symbol.MethodSymbol {
   @Nullable
   @Override
   public MethodSymbol overriddenSymbol() {
-    return overriddenSymbols().stream()
-      .findFirst()
-      .orElse(null);
+    if (overriddenSymbols == null) {
+      // only compute overridenSymbols once
+      overriddenSymbols();
+    }
+    return firstOverridenSymbol;
   }
 
   @Override
   public List<MethodSymbol> overriddenSymbols() {
     if (overriddenSymbols == null) {
       overriddenSymbols = convertOverriddenSymbols();
+      if (!overriddenSymbols.isEmpty()) {
+        firstOverridenSymbol = overriddenSymbols.get(0);
+      }
     }
     return overriddenSymbols;
   }
 
   private List<MethodSymbol> convertOverriddenSymbols() {
     IMethodBinding methodBinding = methodBinding();
-    return find(methodBinding::overrides, methodBinding.getDeclaringClass()).stream()
+    ITypeBinding declaringClass = methodBinding.getDeclaringClass();
+    return findOverridesInParentTypes(methodBinding::overrides, declaringClass).stream()
       .map(sema::methodSymbol)
       .collect(Collectors.toList());
   }
 
-  private List<IMethodBinding> find(Predicate<IMethodBinding> predicate, ITypeBinding typeBinding) {
-    List<IMethodBinding> bindings = new ArrayList<>();
-
-    addMissing(findSuperclassBindings(predicate, typeBinding.getSuperclass(), true), bindings);
-    addMissing(findInterfaceBindings(predicate, typeBinding.getInterfaces()), bindings);
-
-    ITypeBinding objectTypeBinding = Objects.requireNonNull(sema.resolveType("java.lang.Object"));
-    addMissing(findSuperclassBindings(predicate, objectTypeBinding, true), bindings);
-
+  private Set<IMethodBinding> findOverridesInParentTypes(Predicate<IMethodBinding> overridesCondition, ITypeBinding type) {
+    Set<IMethodBinding> bindings = new LinkedHashSet<>();
+    if (type.isInterface()) {
+      // check Object for interfaces forcing overrides from Object
+      bindings.addAll(findOverridesInTypes(overridesCondition, sema.resolveType("java.lang.Object")));
+    } else if (!"java.lang.Object".equals(type.getQualifiedName())) {
+      bindings.addAll(findOverridesInTypes(overridesCondition, type.getSuperclass()));
+    }
+    bindings.addAll(findOverridesInTypes(overridesCondition, type.getInterfaces()));
     return bindings;
   }
 
-  private static List<IMethodBinding> findInterfaceBindings(Predicate<IMethodBinding> predicate, ITypeBinding[] interfaceBindings) {
-    List<IMethodBinding> bindings = new ArrayList<>();
+  private Set<IMethodBinding> findOverridesInTypes(Predicate<IMethodBinding> overridesCondition, ITypeBinding... types) {
+    Set<IMethodBinding> overrides = new LinkedHashSet<>();
 
-    for (ITypeBinding typeBinding : interfaceBindings) {
-      for (IMethodBinding candidate : typeBinding.getDeclaredMethods()) {
-        if (predicate.test(candidate)) {
-          bindings.add(candidate);
-        }
-      }
-
-      bindings.addAll(findInterfaceBindings(predicate, typeBinding.getInterfaces()));
+    for (ITypeBinding type : types) {
+      // check current type
+      Stream.of(type.getDeclaredMethods())
+        .filter(overridesCondition)
+        .findFirst()
+        .ifPresent(overrides::add);
+      // check other inheritance levels
+      overrides.addAll(findOverridesInParentTypes(overridesCondition, type));
     }
-    return bindings;
-  }
-
-  private static List<IMethodBinding> findSuperclassBindings(Predicate<IMethodBinding> predicate, ITypeBinding typeBinding, boolean checkClassMethods) {
-    if (typeBinding == null) {
-      return new ArrayList<>();
-    }
-
-    List<IMethodBinding> bindings = new ArrayList<>();
-
-    if (checkClassMethods) {
-      for (IMethodBinding candidate : typeBinding.getDeclaredMethods()) {
-        if (predicate.test(candidate)) {
-          bindings.add(candidate);
-          checkClassMethods = false;
-        }
-      }
-    }
-
-    bindings.addAll(findSuperclassBindings(predicate, typeBinding.getSuperclass(), checkClassMethods));
-    bindings.addAll(findInterfaceBindings(predicate, typeBinding.getInterfaces()));
-
-    return bindings;
-  }
-
-  private static <T> void addMissing(Collection<T> items, Collection<T> target) {
-    items.forEach(item -> {
-      if (!target.contains(item)) {
-        target.add(item);
-      }
-    });
+    return overrides;
   }
 
   @Override
